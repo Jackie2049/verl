@@ -77,26 +77,26 @@ def compute_data_metrics(batch, use_critic=True):
     if use_critic:
         values = batch.batch["values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        return_diff_var = torch.var(valid_returns - valid_values) if valid_returns.numel() > 0 else float("nan")
+        return_var = torch.var(valid_returns) if valid_returns.numel() > 0 else float("nan")
 
     metrics = {
         # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        "critic/advantages/mean": torch.mean(valid_adv).detach().item() if valid_adv.numel() > 0 else float("nan"),
+        "critic/advantages/max": torch.max(valid_adv).detach().item() if valid_adv.numel() > 0 else float("nan"),
+        "critic/advantages/min": torch.min(valid_adv).detach().item() if valid_adv.numel() > 0 else float("nan"),
         # returns
-        "critic/returns/mean": torch.mean(valid_returns).detach().item(),
-        "critic/returns/max": torch.max(valid_returns).detach().item(),
-        "critic/returns/min": torch.min(valid_returns).detach().item(),
+        "critic/returns/mean": torch.mean(valid_returns).detach().item() if valid_returns.numel() > 0 else float("nan"),
+        "critic/returns/max": torch.max(valid_returns).detach().item() if valid_returns.numel() > 0 else float("nan"),
+        "critic/returns/min": torch.min(valid_returns).detach().item() if valid_returns.numel() > 0 else float("nan"),
         **(
             {
                 # values
-                "critic/values/mean": torch.mean(valid_values).detach().item(),
-                "critic/values/max": torch.max(valid_values).detach().item(),
-                "critic/values/min": torch.min(valid_values).detach().item(),
+                "critic/values/mean": torch.mean(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
+                "critic/values/max": torch.max(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
+                "critic/values/min": torch.min(valid_values).detach().item() if valid_values.numel() > 0 else float("nan"),
                 # vf explained var
-                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item() if isinstance(return_var, torch.Tensor) else float("nan"),
             }
             if use_critic
             else {}
