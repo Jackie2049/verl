@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
@@ -64,6 +65,39 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _dump_generations_sync(global_steps, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    """Perform the actual JSONL write (runs in background thread pool).
+
+    This is a standalone function (not a method) to avoid capturing mutable
+    trainer state. All data is passed as plain Python types.
+    """
+    os.makedirs(dump_path, exist_ok=True)
+    filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+
+    n = len(inputs)
+    base_data = {
+        "input": inputs,
+        "output": outputs,
+        "gts": gts,
+        "score": scores,
+        "step": [global_steps] * n,
+    }
+
+    for k, v in reward_extra_infos_dict.items():
+        if len(v) == n:
+            base_data[k] = v
+
+    lines = []
+    for i in range(n):
+        entry = {k: v[i] for k, v in base_data.items()}
+        lines.append(json.dumps(entry, ensure_ascii=False))
+
+    with open(filename, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"Dumped generations to {filename}")
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -265,6 +299,9 @@ class RayPPOTrainer:
         self.processor = processor
         self.config = config
 
+        self._dump_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dump_gen")
+        self._dump_futures: list = []
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
 
@@ -386,32 +423,50 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
-        os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        """Dump rollout/validation samples as JSONL (non-blocking).
 
-        n = len(inputs)
-        base_data = {
-            "input": inputs,
-            "output": outputs,
-            "gts": gts,
-            "score": scores,
-            "step": [self.global_steps] * n,
-        }
+        Data preparation (tokenizer decode, tensor transfer) is done synchronously
+        on the caller's side. This method submits the JSON serialization and file
+        I/O to a background thread so the training loop is not blocked.
+        """
+        global_steps = self.global_steps  # snapshot on the main thread
+        self._reap_dump_futures()
+        future = self._dump_executor.submit(
+            _dump_generations_sync,
+            global_steps,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+        )
+        self._dump_futures.append(future)
 
-        for k, v in reward_extra_infos_dict.items():
-            if len(v) == n:
-                base_data[k] = v
+    def _reap_dump_futures(self):
+        """Check completed futures for errors, remove them from tracking list."""
+        still_pending = []
+        for future in self._dump_futures:
+            if future.done():
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Warning: async generation dump failed: {e}")
+            else:
+                still_pending.append(future)
+        self._dump_futures = still_pending
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
-
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
-
-        print(f"Dumped generations to {filename}")
+    def _drain_dump_futures(self, timeout=300):
+        """Wait for all pending dump futures to complete. Call before trainer exit."""
+        if not self._dump_futures:
+            return
+        print(f"Draining {len(self._dump_futures)} pending generation dumps...")
+        for future in self._dump_futures:
+            try:
+                future.result(timeout=timeout)
+            except Exception as e:
+                print(f"Warning: generation dump failed during drain: {e}")
+        self._dump_futures.clear()
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -431,19 +486,20 @@ class RayPPOTrainer:
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
 
-            self._dump_generations(
-                inputs=inputs,
-                outputs=outputs,
-                gts=sample_gts,
-                scores=scores,
-                reward_extra_infos_dict=reward_extra_infos_to_dump,
-                dump_path=rollout_data_dir,
-            )
+        # I/O is submitted to background thread pool -- not included in timer
+        self._dump_generations(
+            inputs=inputs,
+            outputs=outputs,
+            gts=sample_gts,
+            scores=scores,
+            reward_extra_infos_dict=reward_extra_infos_to_dump,
+            dump_path=rollout_data_dir,
+        )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1604,6 +1660,7 @@ class RayPPOTrainer:
                     )
 
                 if is_last_step:
+                    self._drain_dump_futures()
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
