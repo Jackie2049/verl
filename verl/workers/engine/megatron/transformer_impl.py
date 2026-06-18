@@ -1431,6 +1431,23 @@ class MegatronEngineWithLMHead(MegatronEngine):
             output[DCP_SAMPLE_IDS] = tu.get_non_tensor_data(data, key=DCP_SAMPLE_IDS, default=None)
             output[DCP_GROUP_LEADER] = tu.get_non_tensor_data(data, key=DCP_GROUP_LEADER, default=False)
 
+        # Detach model_output tensors from the autograd graph to prevent
+        # per-micro-batch memory retention (same fix as #6699 for FSDPEngine).
+        # MUST happen after loss_function (which needs gradients) and
+        # after dynamic_cp_merge_output (if applicable) because the merge
+        # step requires tensors with grad_fn.
+        model_output = {
+            key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+            for key, value in model_output.items()
+        }
+
+        output = {"loss": loss.detach().item(), "metrics": metrics}
+        if forward_only or not self.engine_config.dynamic_context_parallel:
+            output["model_output"] = model_output
+        if self.engine_config.dynamic_context_parallel:
+            output[DCP_SAMPLE_IDS] = tu.get_non_tensor_data(data, key=DCP_SAMPLE_IDS, default=None)
+            output[DCP_GROUP_LEADER] = tu.get_non_tensor_data(data, key=DCP_GROUP_LEADER, default=False)
+
         # calculate_per_token_loss=True (auto-enabled by Megatron-Bridge at CP>1) puts
         # Megatron in its per-token regime: loss_func must return (loss_sum, num_tokens,
         # output), and finalize_model_grads divides every gradient by the accumulated
