@@ -825,6 +825,15 @@ class MegatronEngineWithLMHead(MegatronEngine):
             scaled_loss = loss
             metrics = {}
 
+        # Detach model_output tensors from the autograd graph to prevent
+        # per-micro-batch memory retention (same fix as #6699 for FSDPEngine).
+        # MUST happen after dynamic_cp_merge_output (if applicable) because
+        # the merge step requires tensors with grad_fn.
+        model_output = {
+            key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+            for key, value in model_output.items()
+        }
+
         output = {
             "model_output": model_output,
             "loss": loss.detach().item(),
