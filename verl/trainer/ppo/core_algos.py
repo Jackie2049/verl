@@ -1503,17 +1503,14 @@ def compute_policy_loss_up_grpo(
     # The loss is simply -advantages * ratio (unbounded positive direction)
     pg_losses_positive = -advantages * ratio
 
-    # For advantages < 0 (negative): standard dual-clip PPO
-    # Clip ratio from BOTH sides (1-clip_ratio_low to 1+clip_ratio_high)
-    # AND dual-clip lower bound clip_ratio_c
+    # For advantages < 0 (negative): SAME as vanilla PPO-clip dual-clip
+    # max(unclipped, clipped) → conservative (takes worse option for negative A)
+    # then min with clip_ratio_c → caps the penalty
     pg_losses_clipped = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses_dual_clipped = -advantages * clip_ratio_c
 
-    # For negative advantages: use the minimum of (unclipped, clipped, dual-clipped)
-    # This is the conservative side — we want to limit how much probability
-    # increases for actions that are worse than average
-    clip_pg_losses_negative = torch.min(pg_losses_positive, pg_losses_clipped)
-    clip_pg_losses_negative = torch.min(clip_pg_losses_negative, pg_losses_dual_clipped)
+    clip_pg_losses1 = torch.maximum(pg_losses_positive, pg_losses_clipped)
+    clip_pg_losses_negative = torch.min(pg_losses_dual_clipped, clip_pg_losses1)
 
     # Combine: positive advantages → unbounded, negative → dual-clipped
     pg_losses = torch.where(advantages >= 0, pg_losses_positive, clip_pg_losses_negative)
