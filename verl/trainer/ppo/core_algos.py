@@ -1376,6 +1376,7 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+
 @register_policy_loss("dppo_tv")
 def compute_policy_loss_dppo_tv(
     old_log_prob: torch.Tensor,
@@ -1453,6 +1454,96 @@ def compute_policy_loss_dppo_tv(
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("up_grpo")  # type: ignore[arg-type]
+def compute_policy_loss_up_grpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """UP-GRPO (Unbounded Positive GRPO) policy loss.
+
+    Based on arXiv:2607.06987. The key difference from vanilla PPO-clip:
+    - For positive advantages (A >= 0): NO upper clip on ratio, allowing
+      unbounded policy improvement for good actions.
+    - For negative advantages (A < 0): standard dual-clip with both lower
+      and upper bounds to prevent excessive probability increase for bad actions.
+
+    This removes the conservative upper clip that limits how much the policy
+    can increase the probability of advantageous actions, which is particularly
+    important for GRPO where group-normalized advantages are used.
+
+    Args:
+        old_log_prob, log_prob, advantages, response_mask, loss_agg_mode, config:
+            Same as compute_policy_loss_vanilla.
+        rollout_is_weights: Optional rollout importance sampling weights.
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get("clip_ratio_c", 3.0)
+
+    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # --- UP-GRPO: Unbounded Positive ---
+    # For advantages >= 0 (positive): NO clip on ratio upper bound
+    # The loss is simply -advantages * ratio (unbounded positive direction)
+    pg_losses_positive = -advantages * ratio
+
+    # For advantages < 0 (negative): SAME as vanilla PPO-clip dual-clip
+    # max(unclipped, clipped) → conservative (takes worse option for negative A)
+    # then min with clip_ratio_c → caps the penalty
+    pg_losses_clipped = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    pg_losses_dual_clipped = -advantages * clip_ratio_c
+
+    clip_pg_losses1 = torch.maximum(pg_losses_positive, pg_losses_clipped)
+    clip_pg_losses_negative = torch.min(pg_losses_dual_clipped, clip_pg_losses1)
+
+    # Combine: positive advantages → unbounded, negative → dual-clipped
+    pg_losses = torch.where(advantages >= 0, pg_losses_positive, clip_pg_losses_negative)
+
+    # Clip fraction metrics
+    # Positive clipfrac: how often positive-advantage tokens had ratio > 1+clip_ratio_high
+    # (In UP-GRPO, these are NOT clipped, so this metric shows the "would-have-been-clipped" rate)
+    positive_mask = (advantages >= 0).float()
+    pg_clipfrac = verl_F.masked_mean(
+        positive_mask * torch.gt(ratio, 1 + clip_ratio_high).float(),
+        response_mask,
+    )
+    # Negative clipfrac: how often negative-advantage tokens were clipped
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(pg_losses_positive, pg_losses_clipped).float() * (advantages < 0).float(),
+        response_mask,
+    )
+
+    # Apply rollout correction weights if provided
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/up_grpo_positive_ratio": verl_F.masked_mean(
+            ratio * positive_mask, response_mask
+        ).detach().item(),
     }
     return pg_loss, pg_metrics
 
@@ -1540,6 +1631,7 @@ def compute_policy_loss_dppo_kl(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
 
 
 @register_policy_loss("gspo")
@@ -2539,8 +2631,21 @@ def compute_policy_loss_bypass_mode(
             rollout_is_weights=None,  # Explicitly None - no IS weights for PPO-clip
         )
 
+    elif loss_type == "up_grpo":
+        # UP-GRPO: Same IS handling as PPO-clip (ratio-based, no explicit IS weights)
+        # The unbounded-positive clipping applies after IS ratio computation
+        pg_loss, pg_metrics = compute_policy_loss_up_grpo(  # type: ignore[call-arg]
+            old_log_prob=rollout_log_prob,  # = old_log_prob in bypass mode
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=effective_mask,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=None,  # Same as PPO-clip: no explicit IS weights
+        )
+
     else:
-        raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
+        raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce', 'ppo_clip', or 'up_grpo'.")
 
     # Merge rollout correction metrics
     pg_metrics.update(rollout_metrics)
