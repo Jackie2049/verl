@@ -1424,6 +1424,22 @@ class MegatronEngineWithLMHead(MegatronEngine):
             loss = torch.tensor(1.0, device=device)
             scaled_loss = loss
             metrics = {}
+        # Detach model_output tensors from the autograd graph to prevent
+        # per-micro-batch memory retention. They are only consumed for
+        # metrics/postprocessing after backward, and keeping their grad_fn
+        # alive retains part of every micro-batch's autograd graph until
+        # the whole batch finishes. With PEFT (enable_input_require_grads)
+        # this pins the checkpointed embedding output plus its gradient
+        # buffer per micro-batch, which accumulates across micro-batches
+        # and OOMs the actor update.
+        # Note: detach must happen AFTER loss_function (which needs
+        # gradients) and AFTER dynamic_cp_merge_output (if applicable)
+        # because the CP merge step requires tensors with grad_fn.
+        model_output = {
+            key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+            for key, value in model_output.items()
+        }
+
         output = {"loss": loss.detach().item(), "metrics": metrics}
         if forward_only or not self.engine_config.dynamic_context_parallel:
             output["model_output"] = model_output

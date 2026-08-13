@@ -363,6 +363,9 @@ class TorchTitanEngine(BaseEngine):
                 loss, output = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
                 if not forward_only:
                     loss.backward()
+                    # Training discards model_output (train_batch pops it); keeping it accumulates
+                    # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
+                    output.pop("model_output", None)
             output_lst.append(output)
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
@@ -747,6 +750,18 @@ class TorchTitanEngineWithLMHead(TorchTitanEngine):
             logits = self.model_forward_step(inputs=input_ids, extra_inputs=extra_inputs, extra_kwargs=extra_kwargs)
 
             model_output = self.prepare_model_outputs(logits=logits, output_args=output_args, micro_batch=micro_batch)
+
+            # Detach model outputs before they are appended to forward_backward_batch's
+            # output_lst: they are only consumed for metrics/postprocessing after backward,
+            # and keeping their grad_fn alive retains part of every micro-batch's autograd
+            # graph until the whole batch finishes. With PEFT (enable_input_require_grads)
+            # this pins the checkpointed embedding output plus its gradient buffer per
+            # micro-batch (~2 x [total_nnz, hidden] for long sequences), which accumulates
+            # across micro-batches and OOMs the actor update.
+            model_output = {
+                key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+                for key, value in model_output.items()
+            }
 
             if loss_function is not None:
                 loss, metrics = loss_function(
