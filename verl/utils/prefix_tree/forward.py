@@ -116,6 +116,13 @@ def _build_flex_key(params, device, subtrie=None):
     if subtrie is None:
         raise RuntimeError("_build_flex_key: subtrie required for flex (trie topology)")
 
+    cp_world_size = mpu.get_context_parallel_world_size() if _dist.is_initialized() else 1
+    if isinstance(cp_world_size, int) and cp_world_size > 1:
+        raise ValueError(
+            "prefix_tree attention backend 'flex' does not support context_parallel_size > 1, "
+            "please run with context_parallel_size=1 or use prefix_tree_attention='magi'"
+        )
+
     # DFS enter/exit times: u is ancestor-or-self of v iff tin[u] <= tin[v] <= tout[u].
     tin: dict[int, int] = {}
     tout: dict[int, int] = {}
