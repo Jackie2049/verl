@@ -214,4 +214,19 @@ def compute_advantage_for_multi_trajectories(
 
     data.batch["advantages"] = scores
     data.batch["returns"] = scores
+
+    # Safety guard: replace NaN/Inf in advantages and returns with 0.0.
+    # NaN rewards propagate as NaN advantages → NaN loss → NaN parameters → crash.
+    adv = data.batch["advantages"]
+    if torch.any(torch.isnan(adv)) or torch.any(torch.isinf(adv)):
+        nan_count = torch.sum(torch.isnan(adv)).item()
+        inf_count = torch.sum(torch.isinf(adv)).item()
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "NaN/Inf in advantages (nan=%d, inf=%d). Replacing with 0.0.", nan_count, inf_count,
+        )
+        data.batch["advantages"] = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+        data.batch["returns"] = torch.nan_to_num(data.batch["returns"], nan=0.0, posinf=0.0, neginf=0.0)
+
     return data

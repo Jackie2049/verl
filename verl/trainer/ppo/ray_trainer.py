@@ -24,6 +24,8 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
+import logging
+import os
 from typing import Any, Optional
 
 import numpy as np
@@ -65,6 +67,9 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 from verl.utils.py_functional import rename_dict
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.skip.skip_manager import SkipManager
@@ -279,6 +284,26 @@ def compute_advantage(
         advantages, returns = adv_estimator_fn(**adv_kwargs)
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+    # Safety guard: replace NaN/Inf in advantages and returns with 0.0.
+    # NaN rewards (from FP8 quantization, corrupted data, or reward model failures)
+    # propagate as NaN advantages → NaN loss → NaN model parameters → training crash.
+    # Replacing NaN with 0.0 (zero advantage = no learning signal) is the same approach
+    # used by TRL's GRPOTrainer and prevents silent training destruction.
+    adv = data.batch["advantages"]
+    ret = data.batch["returns"]
+    if torch.any(torch.isnan(adv)) or torch.any(torch.isinf(adv)):
+        nan_count = torch.sum(torch.isnan(adv)).item()
+        inf_count = torch.sum(torch.isinf(adv)).item()
+        logger.warning(
+            "NaN/Inf detected in advantages (nan=%d, inf=%d). "
+            "Replacing with 0.0 to prevent training crash. "
+            "Investigate reward model or data pipeline for root cause.",
+            nan_count, inf_count,
+        )
+        data.batch["advantages"] = torch.nan_to_num(adv, nan=0.0, posinf=0.0, neginf=0.0)
+        data.batch["returns"] = torch.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
+
     return data
 
 
