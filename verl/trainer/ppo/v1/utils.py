@@ -205,8 +205,16 @@ def compute_advantage_for_multi_trajectories(
         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         config=config,
     )
-    first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+    # Safety guard: response_mask.argmax(dim=1) on all-zero rows returns 0,
+    # which would extract a garbage advantage value at position 0.
+    # Replace argmax with a safe version that uses index 0 for valid rows
+    # (any valid index works since all positions have the same scalar advantage)
+    # and sets advantage to 0.0 for rows with no valid tokens.
+    response_mask = final_data.batch["response_mask"]
+    row_has_valid = response_mask.sum(dim=1) > 0
+    first_nnz_indices = response_mask.argmax(dim=1)
     final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
+    final_scores = torch.where(row_has_valid, final_scores, torch.zeros_like(final_scores))
 
     # scatter final scores to all rows in batch data
     scores = final_scores[row_to_local_index]
